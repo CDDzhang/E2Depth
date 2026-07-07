@@ -71,8 +71,11 @@ class PoseFiLM(nn.Module):
 
 class PoseRefineDecoder(nn.Module):
     """
-    Fuses layer3 + layer4 from ResNet to predict full 6DoF pose directly.
-    No residual/delta — outputs the complete pose vector, scaled by 0.01.
+    Fuses layer3 + layer4 from ResNet to predict a 6DoF residual (delta)
+    on top of the pose prior, scaled by 0.01.
+
+    out_conv is zero-initialized so that delta = 0 at step 0, i.e. the
+    network output exactly equals the prior at initialization.
     """
     def __init__(self, num_ch_enc):
         super().__init__()
@@ -87,6 +90,8 @@ class PoseRefineDecoder(nn.Module):
             nn.Conv2d(256, 256, 3, padding=1), nn.ReLU(True),
         )
         self.out_conv = nn.Conv2d(256, 6, 1)
+        nn.init.zeros_(self.out_conv.weight)
+        nn.init.zeros_(self.out_conv.bias)
     
     def forward(self, feat3, feat4):
         f4 = self.squeeze4(feat4)
@@ -105,12 +110,21 @@ class PriorPoseNet(nn.Module):
     """
     GT-prior conditioned pose network, front camera only.
     
-    v2 key changes:
-      - No compose: network directly outputs full (axisangle, translation)
-      - Prior is only a FiLM conditioning hint, not composed with output
-      - No axis-angle ↔ matrix round-trips in forward pass
-      - Curriculum noise: noise sigma and dropout ramp 0 → target over
-        noise_warmup_steps (default 1000), then stay at target level
+    v3 key changes (residual + validity flag):
+      - Residual parameterization in 6D vector space:
+            aa_out = aa_prior + delta_aa,  t_out = t_prior + delta_t
+        Decoder out_conv is zero-initialized, so the output equals the
+        prior at step 0. Frame-to-frame rotations are small, so additive
+        composition in vector space differs from manifold composition
+        only by second-order terms. No axis-angle <-> matrix round-trips.
+      - FiLM conditioning input is 7D: [aa_prior, t_prior, valid_flag].
+        valid_flag = 1 when a prior is present, 0 when the prior is
+        dropped (curriculum dropout) or unavailable (eval fallback).
+        This disambiguates "prior missing" from "near-zero motion".
+        When the prior is dropped, prior = 0 and delta alone carries the
+        full pose, which is consistent with the residual formulation.
+      - Curriculum noise: noise sigma and dropout ramp 0 -> target over
+        noise_warmup_steps, then stay at target level
       - Output interface identical to MonoPoseNet
     """
     def __init__(self, cfg):
@@ -123,7 +137,7 @@ class PriorPoseNet(nn.Module):
         
         ch4 = self.pose_encoder.num_ch_enc[-1]
         self.post_film_norm = nn.LayerNorm([ch4])
-        self.pose_film = PoseFiLM(feat_dim=ch4, pose_dim=6)
+        self.pose_film = PoseFiLM(feat_dim=ch4, pose_dim=7)  # 6D prior + validity flag
         self.pose_decoder = PoseRefineDecoder(self.pose_encoder.num_ch_enc)
         
         self.noise_rot_sigma = cfg.get('pose', {}).get('noise_rot_sigma', 0.002)
@@ -148,18 +162,24 @@ class PriorPoseNet(nn.Module):
         return min(self._train_step.item() / self.noise_warmup_steps, 1.0)
 
     @torch.no_grad()
-    def _prepare_prior(self, T_gt, B, device):
+    def _prepare_prior(self, T_gt, B, device, has_prior):
         """
-        Prepare 6D pose prior from GT 4x4 matrix.
+        Prepare 6D pose prior and validity flag from GT 4x4 matrix.
         Entirely detached — no gradient flows through the prior.
         
         Training: GT + curriculum noise + curriculum dropout.
           - Noise sigma ramps from 0 → target over warmup_steps
           - Dropout prob ramps from 0 → gt_drop_prob over warmup_steps
-        Eval: GT directly (or identity if unavailable).
+          - valid = 0 for dropped samples, 1 otherwise
+        Eval: GT directly with valid = 1, or zeros with valid = 0
+        when no prior is available (has_prior=False).
         """
         aa_gt, t_gt = _mat_to_pose_vec(T_gt)
-        
+
+        if not has_prior:
+            valid = torch.zeros(B, 1, device=device)
+            return torch.zeros_like(aa_gt), torch.zeros_like(t_gt), valid
+
         if self.training:
             ratio = self._get_curriculum_ratio()
             
@@ -173,11 +193,13 @@ class PriorPoseNet(nn.Module):
             drop = (torch.rand(B, 1, device=device) < cur_drop_prob).float()
             aa_prior = aa_prior * (1 - drop)
             t_prior = t_prior * (1 - drop)
+            valid = 1.0 - drop
         else:
             aa_prior = aa_gt
             t_prior = t_gt
+            valid = torch.ones(B, 1, device=device)
         
-        return aa_prior, t_prior
+        return aa_prior, t_prior, valid
     
     def forward(self, inputs, frame_ids, cam):
         """
@@ -205,7 +227,8 @@ class PriorPoseNet(nn.Module):
         img_pair = torch.cat(pose_inputs, dim=1)
 
         # ---- Prepare GT prior (detached, no gradient) ----
-        if self.training and 'pose' in inputs:
+        has_prior = self.training and 'pose' in inputs
+        if has_prior:
             gt_T = self._get_gt_pose_from_inputs(inputs, cam, frame_id)
             T_gt_for_net = torch.inverse(gt_T) if invert else gt_T
         else:
@@ -214,16 +237,21 @@ class PriorPoseNet(nn.Module):
         # ---- Encode + FiLM hint + Decode ----
         feats = self.pose_encoder(img_pair)
 
-        aa_prior, t_prior = self._prepare_prior(T_gt_for_net, B, device)
-        prior_6d = torch.cat([aa_prior, t_prior], dim=1)   # [B, 6], detached
-        feats[-1] = self.pose_film(feats[-1], prior_6d)
+        aa_prior, t_prior, valid = self._prepare_prior(T_gt_for_net, B, device, has_prior)
+        prior_in = torch.cat([aa_prior, t_prior, valid], dim=1)   # [B, 7], detached
+        feats[-1] = self.pose_film(feats[-1], prior_in)
         B_f, C, H, W = feats[-1].shape
         feats[-1] = self.post_film_norm(feats[-1].permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
-        # ---- Direct 6DoF output (no compose, no axis-angle round-trip) ----
-        out_6d = self.pose_decoder(feats[-2], feats[-1])    # [B, 6]
-        axisangle   = out_6d[:, :3].unsqueeze(1).unsqueeze(1)   # [B, 1, 1, 3]
-        translation = out_6d[:, 3:].unsqueeze(1).unsqueeze(1)   # [B, 1, 1, 3]
+        # ---- Residual 6DoF output: prior + delta (vector-space compose) ----
+        # Dropped/unavailable prior is exactly zero, so delta alone carries
+        # the full pose in that mode; otherwise delta refines the prior.
+        delta_6d = self.pose_decoder(feats[-2], feats[-1])    # [B, 6], zero at init
+        aa_out = aa_prior + delta_6d[:, :3]
+        t_out = t_prior + delta_6d[:, 3:]
+
+        axisangle   = aa_out.unsqueeze(1).unsqueeze(1)   # [B, 1, 1, 3]
+        translation = t_out.unsqueeze(1).unsqueeze(1)    # [B, 1, 1, 3]
 
         return axisangle, torch.clamp(translation, -self.trans_clamp, self.trans_clamp)
 
